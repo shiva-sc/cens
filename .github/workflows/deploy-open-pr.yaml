@@ -74,6 +74,13 @@ jobs:
 
               if ! git merge "$branch" --no-ff --no-edit -m "Merge branch '$branch' into combined preview"; then
                 echo "❌ CRITICAL: Conflict detected merging branch '$branch'!"
+                git diff --name-only --diff-filter=U > conflicting_files.txt
+                echo "Conflicting files:"
+                if [ -s conflicting_files.txt ]; then
+                  cat conflicting_files.txt
+                else
+                  echo "Could not determine conflicting files."
+                fi
                 conflicting_pr_number=$(gh pr list --state all --head "$branch" --json number --jq '.[0].number // empty')
                 conflicting_pr=$(gh pr list --state all --head "$branch" --json number,title,url --jq '.[0] | if . == null then "No associated PR found" else "[#\(.number): \(.title)](\(.url))" end' || printf 'Pull request lookup failed')
                 printf '%s\n%s\n' "$branch" "$conflicting_pr" > conflicting_details.txt
@@ -109,14 +116,21 @@ jobs:
             const fs = require('fs');
             let conflictingBranch = 'Unknown branch';
             let conflictingPr = 'Unknown pull request';
+            let conflictingFiles = 'Could not determine conflicting files.';
             if (fs.existsSync('conflicting_details.txt')) {
               const [branch, ...pullRequestLines] = fs.readFileSync('conflicting_details.txt', 'utf8').trimEnd().split('\n');
               conflictingBranch = branch || conflictingBranch;
               conflictingPr = pullRequestLines.join('\n') || conflictingPr;
             }
+            if (fs.existsSync('conflicting_files.txt')) {
+              const files = fs.readFileSync('conflicting_files.txt', 'utf8').trim().split('\n').filter(Boolean);
+              if (files.length > 0) {
+                conflictingFiles = files.map(file => `- \`${file.replace(/`/g, '\\`')}\``).join('\n');
+              }
+            }
 
             const issue_number = context.issue.number;
-            const body = `🚨 **Combined Integration Build Failed** 🚨\n\nThis pull request could not be safely packaged into the combined preview build because a git merge conflict was detected with branch: \`${conflictingBranch}\` (associated PR: ${conflictingPr}).\n\nBecause older, ready-to-review PRs are processed first, please check for architectural overlaps with newer code changes or the base branch.`;
+            const body = `🚨 **Combined Integration Build Failed** 🚨\n\nThis pull request could not be safely packaged into the combined preview build because a git merge conflict was detected with branch: \`${conflictingBranch}\` (associated PR: ${conflictingPr}).\n\n**Conflicting files:**\n${conflictingFiles}\n\nBecause older, ready-to-review PRs are processed first, please check for architectural overlaps with newer code changes or the base branch.`;
             await github.rest.issues.createComment({
               owner: context.repo.owner,
               repo: context.repo.repo,
