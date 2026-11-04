@@ -26,6 +26,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+      issues: write
       packages: write
       pull-requests: write
 
@@ -51,7 +52,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           echo "Fetching open, non-draft pull requests (Oldest First)..."
-          PR_BRANCHES=$(gh pr list --state open --draft=false --json headRefName,createdAt --jq 'sort_by(.createdAt) | .[].headRefName')
+          PR_BRANCHES=$(gh pr list --state open --draft=false --json headRefName,createdAt,labels --jq 'sort_by(.createdAt) | map(select(all(.labels[]; .name != "merge-conflict"))) | .[].headRefName')
 
           if [ -z "$PR_BRANCHES" ] || [ "$PR_BRANCHES" = "" ]; then
             echo "has_prs=false" >> $GITHUB_OUTPUT
@@ -73,9 +74,18 @@ jobs:
 
               if ! git merge "$branch" --no-ff --no-edit -m "Merge branch '$branch' into combined preview"; then
                 echo "❌ CRITICAL: Conflict detected merging branch '$branch'!"
+                conflicting_pr_number=$(gh pr list --state all --head "$branch" --json number --jq '.[0].number // empty')
                 conflicting_pr=$(gh pr list --state all --head "$branch" --json number,title,url --jq '.[0] | if . == null then "No associated PR found" else "[#\(.number): \(.title)](\(.url))" end' || printf 'Pull request lookup failed')
                 printf '%s\n%s\n' "$branch" "$conflicting_pr" > conflicting_details.txt
                 git merge --abort || true
+                if [ -n "$conflicting_pr_number" ]; then
+                  if ! gh label list --limit 1000 --json name --jq 'any(.[]; .name == "merge-conflict")' | grep -qx true; then
+                    gh label create merge-conflict --color D73A4A --description "PR conflicts with the combined preview branch"
+                  fi
+                  gh pr edit "$conflicting_pr_number" --add-label merge-conflict
+                else
+                  echo "❌ Could not find the pull request for conflicting branch '$branch'; unable to add the merge-conflict label."
+                fi
                 exit 1
               fi
               echo "✅ Successfully merged $branch"
