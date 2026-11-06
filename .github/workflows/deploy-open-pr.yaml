@@ -1,134 +1,170 @@
 name: Build Combined Open PRs
 
 on:
-  pull_request:
+  pull_request_target:
+    # For pull_request_target, branches filters the PR's target (base) branch.
     branches:
       - main
       - master
     types:
       - opened
       - synchronize
+      - reopened
       - closed
 
   workflow_dispatch:
+    inputs:
+      source_sha:
+        description: Commit to build from the combined preview branch
+        required: true
+        type: string
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  group: combined-open-pr-preview
+  cancel-in-progress: false
+
+permissions:
+  contents: read
 
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}
   VERIFICATION_BRANCH: unstable/dev
+  BASE_BRANCH: ${{ github.event.pull_request.base.ref || github.event.repository.default_branch }}
 
 jobs:
-  merge-and-build:
+  # This privileged job only combines Git refs and dispatches the isolated image build.
+  # It does not run scripts or build containers from pull request code.
+  combine-open-prs:
+    # Keep composition limited to PRs targeting main or master, even if the trigger changes later.
+    if: github.event_name == 'pull_request_target' && (github.event.pull_request.base.ref == 'main' || github.event.pull_request.base.ref == 'master')
     runs-on: ubuntu-latest
     permissions:
+      actions: write
       contents: write
-      packages: write
       pull-requests: write
 
     steps:
-      # 1. Check out the base branch (master)
-      - name: Checkout Base Branch
-        uses: actions/checkout@v5
+      # Start from the PR's target branch; for pull_request_target this is trusted base code.
+      - name: Check out the PR target branch
+        uses: actions/checkout@v7
         with:
-          ref: master
+          ref: ${{ env.BASE_BRANCH }}
           fetch-depth: 0
-          persist-credentials: true
+          persist-credentials: false
 
-      # 2. Configure Git Identity
-      - name: Set up Git User
+      # Identify generated merge commits consistently in the preview branch.
+      - name: Set up Git identity
         run: |
-          git config --global user.name "github-actions[bot]"
-          git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-      # 3. Fetch all open, non-draft PRs sorted oldest to newest and merge them
-      - name: Merge All Open PRs
+      # Fetch PR refs by number so fork branches work without using branch names in shell commands.
+      - name: Merge all open, ready-for-review PRs
         id: merge_step
         env:
           GH_TOKEN: ${{ github.token }}
+          BASE_BRANCH: ${{ env.BASE_BRANCH }}
         run: |
-          echo "Fetching open, non-draft pull requests (Oldest First)..."
-          PR_BRANCHES=$(gh pr list --state open --draft=false --json headRefName,createdAt --jq 'sort_by(.createdAt) | .[].headRefName')
+          echo "Fetching open, non-draft PRs targeting '$BASE_BRANCH' (oldest first)..."
+          pr_numbers=$(gh pr list --state open --base "$BASE_BRANCH" --limit 1000 --json number,createdAt,isDraft --jq 'map(select(.isDraft == false)) | sort_by(.createdAt) | .[].number')
+          git_auth_header="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$GH_TOKEN" | base64 | tr -d '\n')"
 
-          if [ -z "$PR_BRANCHES" ] || [ "$PR_BRANCHES" = "" ]; then
-            echo "has_prs=false" >> $GITHUB_OUTPUT
-            echo "No open, ready-for-review PRs found. Preview branch will reset to master."
+          if [ -z "$pr_numbers" ]; then
+            echo "No open, ready-for-review PRs found for '$BASE_BRANCH'."
           else
-            echo "has_prs=true" >> $GITHUB_OUTPUT
-            # Clean up any local branches from previous runs
-            git branch | grep -v '^*' | grep -v 'master' | grep -v "${{ env.VERIFICATION_BRANCH }}" | xargs -r git branch -D || true
+            while IFS= read -r pr_number; do
+              [ -n "$pr_number" ] || continue
+              echo "Merging PR #$pr_number"
+              pr_ref="refs/remotes/pull/$pr_number/head"
 
-            for branch in $PR_BRANCHES; do
-              echo "--------------------------------------------------"
-              echo "Attempting to merge branch: $branch"
-              echo "--------------------------------------------------"
+              if ! git -c "http.https://github.com/.extraheader=$git_auth_header" fetch --no-tags origin "refs/pull/$pr_number/head:$pr_ref"; then
+                echo "Failed to fetch PR #$pr_number."
+                exit 1
+              fi
 
-              git fetch origin "$branch:$branch" || {
-                echo "❌ Failed to fetch branch '$branch' (may be from a fork). Skipping."
-                continue
-              }
-
-              if ! git merge "$branch" --no-ff --no-edit -m "Merge branch '$branch' into combined preview"; then
-                echo "❌ CRITICAL: Conflict detected merging branch '$branch'!"
-                conflicting_pr=$(gh pr list --state all --head "$branch" --json number,title,url --jq '.[0] | if . == null then "No associated PR found" else "[#\(.number): \(.title)](\(.url))" end' || printf 'Pull request lookup failed')
-                printf '%s\n%s\n' "$branch" "$conflicting_pr" > conflicting_details.txt
+              if ! git merge "$pr_ref" --no-ff --no-edit -m "Merge PR #$pr_number into combined preview"; then
+                conflicting_pr=$(gh pr view "$pr_number" --json number,title,url --jq '"[#\(.number): \(.title)](\(.url))"' || printf 'Pull request lookup failed')
+                printf 'PR #%s\n%s\n' "$pr_number" "$conflicting_pr" > conflicting_details.txt
                 git merge --abort || true
                 exit 1
               fi
-              echo "✅ Successfully merged $branch"
-              git branch -D "$branch" || true
-            done
+            done <<< "$pr_numbers"
           fi
 
-      # 4. Push to a Fixed Verification Branch (Overwrites on each run)
-      - name: Push Combined Verification Branch
-        run: |
-          echo "Updating fixed verification branch: ${{ env.VERIFICATION_BRANCH }}"
-          git checkout -B ${{ env.VERIFICATION_BRANCH }}
-          git push origin ${{ env.VERIFICATION_BRANCH }} --force-with-lease
-
-      # 5. Post a comment on the triggering PR if a merge conflict occurs
-      - name: Post Failure Comment to PR
-        if: failure() && github.event_name == 'pull_request' && steps.merge_step.outcome == 'failure'
-        uses: actions/github-script@v7
+      # Report merge or fetch failures on the PR that triggered this composition run.
+      - name: Comment on the triggering PR if a merge conflict occurs
+        if: failure() && github.event_name == 'pull_request_target' && steps.merge_step.outcome == 'failure'
+        uses: actions/github-script@v9
         with:
           script: |
             const fs = require('fs');
-            let conflictingBranch = 'Unknown branch';
             let conflictingPr = 'Unknown pull request';
             if (fs.existsSync('conflicting_details.txt')) {
-              const [branch, ...pullRequestLines] = fs.readFileSync('conflicting_details.txt', 'utf8').trimEnd().split('\n');
-              conflictingBranch = branch || conflictingBranch;
-              conflictingPr = pullRequestLines.join('\n') || conflictingPr;
+              const [, ...details] = fs.readFileSync('conflicting_details.txt', 'utf8').trimEnd().split('\n');
+              conflictingPr = details.join('\n') || conflictingPr;
             }
 
-            const issue_number = context.issue.number;
-            const body = `🚨 **Combined Integration Build Failed** 🚨\n\nThis pull request could not be safely packaged into the combined preview build because a git merge conflict was detected with branch: \`${conflictingBranch}\` (associated PR: ${conflictingPr}).\n\nBecause older, ready-to-review PRs are processed first, please check for architectural overlaps with newer code changes or the base branch.`;
             await github.rest.issues.createComment({
               owner: context.repo.owner,
               repo: context.repo.repo,
-              issue_number: issue_number,
-              body: body
+              issue_number: context.issue.number,
+              body: `🚨 **Combined Integration Build Failed** 🚨\n\nThe workflow could not combine the open pull requests. This can happen because of a merge conflict or an unavailable PR ref. Related PR: ${conflictingPr}.`
             });
 
-      # 6. Authenticate to GitHub Packages (GHCR)
-      # Skip if there are no open PRs left (saves actions minutes)
-      - name: Log in to the Container Registry
-        if: steps.merge_step.outputs.has_prs != 'false'
-        uses: docker/login-action@v3
+      # Refresh the fixed preview branch, including resetting it to the base when no PRs remain.
+      - name: Update the combined preview branch
+        id: preview
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERIFICATION_BRANCH: ${{ env.VERIFICATION_BRANCH }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          git checkout -B "$VERIFICATION_BRANCH"
+          source_sha=$(git rev-parse HEAD)
+          git_auth_header="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$GH_TOKEN" | base64 | tr -d '\n')"
+          git -c "http.https://github.com/.extraheader=$git_auth_header" push origin "HEAD:refs/heads/$VERIFICATION_BRANCH" --force
+          echo "source_sha=$source_sha" >> "$GITHUB_OUTPUT"
+
+      # workflow_dispatch is permitted to start a new run with GITHUB_TOKEN; pushes are not.
+      - name: Dispatch the isolated image build
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          SOURCE_SHA: ${{ steps.preview.outputs.source_sha }}
+        run: |
+          gh workflow run .github/workflows/deploy-open-pr.yaml \
+            --ref "$DEFAULT_BRANCH" \
+            --field "source_sha=$SOURCE_SHA"
+
+  # This separate workflow_dispatch run builds the composed commit; it is not a PR composition run.
+  build-preview:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      # Check out the exact combined commit produced by the composition job.
+      - name: Check out the combined preview commit
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.source_sha }}
+          persist-credentials: false
+
+      # Authenticate only for publishing to GHCR.
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v4
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # 7. Extract metadata for Docker tags
+      # Create stable and timestamped tags for the combined preview image.
       - name: Extract Docker metadata
-        if: steps.merge_step.outputs.has_prs != 'false'
         id: meta
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action@v6
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           tags: |
@@ -136,15 +172,13 @@ jobs:
             type=raw,value=combined-{{date 'YYYYMMDD-HHmmss'}}
             type=raw,value=combined-latest
 
-      # 8. Set up Docker Buildx
+      # Configure Buildx for the image build.
       - name: Set up Docker Buildx
-        if: steps.merge_step.outputs.has_prs != 'false'
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@v4
 
-      # 9. Build and push the Docker image
-      - name: Build and Push Docker Image
-        if: steps.merge_step.outputs.has_prs != 'false'
-        uses: docker/build-push-action@v6
+      # Build the combined source and publish its tags to GHCR.
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v7
         with:
           context: .
           push: true
